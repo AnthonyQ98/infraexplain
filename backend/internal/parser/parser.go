@@ -1,136 +1,149 @@
 package parser
 
 import (
-	"regexp"
+	"fmt"
+	"log"
 	"strings"
+
+	"github.com/hashicorp/hcl/v2/hclparse"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/zclconf/go-cty/cty"
 )
 
-// TerraformResource represents a parsed Terraform resource
+// TerraformResource represents a parsed resource
 type TerraformResource struct {
 	Type       string            `json:"type"`
 	Name       string            `json:"name"`
 	Properties map[string]string `json:"properties"`
 }
 
-// TerraformConfig represents the parsed Terraform configuration
+// TerraformConfig represents parsed TF code
 type TerraformConfig struct {
 	Resources []TerraformResource `json:"resources"`
-	Variables []string             `json:"variables"`
-	Outputs   []string             `json:"outputs"`
+	Variables []string            `json:"variables"`
+	Outputs   []string            `json:"outputs"`
+	Issues    []Issue             `json:"issues"`
 }
 
-// ParseTerraform parses Terraform code and returns structured data
+// Issue represents a security or improvement finding
+type Issue struct {
+	Type    string `json:"type"` // "security" or "improvement"
+	Message string `json:"message"`
+}
+
+// ParseTerraform parses Terraform HCL code and returns structured data with basic issues
 func ParseTerraform(terraformCode string) (*TerraformConfig, error) {
 	config := &TerraformConfig{
 		Resources: []TerraformResource{},
 		Variables: []string{},
 		Outputs:   []string{},
+		Issues:    []Issue{},
 	}
 
-	// Extract resources
-	resourcePattern := regexp.MustCompile(`resource\s+"([^"]+)"\s+"([^"]+)"\s*\{`)
-	resourceMatches := resourcePattern.FindAllStringSubmatch(terraformCode, -1)
+	parser := hclparse.NewParser()
+	file, diags := parser.ParseHCL([]byte(terraformCode), "input.tf")
+	if diags.HasErrors() {
+		return config, fmt.Errorf("failed to parse HCL: %v", diags)
+	}
 
-	for _, match := range resourceMatches {
-		if len(match) >= 3 {
-			resourceType := match[1]
-			resourceName := match[2]
+	body, ok := file.Body.(*hclsyntax.Body)
+	if !ok {
+		return config, fmt.Errorf("unexpected body type")
+	}
 
-			// Extract resource block
-			resourceBlock := extractResourceBlock(terraformCode, match[0])
-			properties := extractProperties(resourceBlock)
+	// Walk through blocks
+	for _, block := range body.Blocks {
+		switch block.Type {
+		case "resource":
+			if len(block.Labels) < 2 {
+				continue
+			}
+			resType := block.Labels[0]
+			resName := block.Labels[1]
+			props := extractProperties(block.Body)
 
 			config.Resources = append(config.Resources, TerraformResource{
-				Type:       resourceType,
-				Name:       resourceName,
-				Properties: properties,
+				Type:       resType,
+				Name:       resName,
+				Properties: props,
 			})
-		}
-	}
 
-	// Extract variables
-	variablePattern := regexp.MustCompile(`variable\s+"([^"]+)"`)
-	variableMatches := variablePattern.FindAllStringSubmatch(terraformCode, -1)
-	for _, match := range variableMatches {
-		if len(match) >= 2 {
-			config.Variables = append(config.Variables, match[1])
-		}
-	}
+			// Basic security checks
+			checkResourceSecurity(resType, resName, props, &config.Issues)
+			log.Printf("issues: %v", config.Issues)
 
-	// Extract outputs
-	outputPattern := regexp.MustCompile(`output\s+"([^"]+)"`)
-	outputMatches := outputPattern.FindAllStringSubmatch(terraformCode, -1)
-	for _, match := range outputMatches {
-		if len(match) >= 2 {
-			config.Outputs = append(config.Outputs, match[1])
+		case "variable":
+			if len(block.Labels) >= 1 {
+				config.Variables = append(config.Variables, block.Labels[0])
+			}
+		case "output":
+			if len(block.Labels) >= 1 {
+				config.Outputs = append(config.Outputs, block.Labels[0])
+			}
 		}
 	}
 
 	return config, nil
 }
 
-// extractResourceBlock extracts the full resource block from the Terraform code
-func extractResourceBlock(code, startMatch string) string {
-	startIdx := strings.Index(code, startMatch)
-	if startIdx == -1 {
-		return ""
+// extractProperties converts HCL attributes into a simple key=value map
+func extractProperties(body *hclsyntax.Body) map[string]string {
+	props := make(map[string]string)
+	for name, attr := range body.Attributes {
+		val, diag := attr.Expr.Value(nil)
+		if diag.HasErrors() {
+			props[name] = "<unknown>"
+			continue
+		}
+
+		// Safely convert any type to string
+		switch val.Type().FriendlyName() {
+		case "string":
+			props[name] = val.AsString()
+		case "list", "tuple":
+			elems := make([]string, val.LengthInt())
+			for i := 0; i < val.LengthInt(); i++ {
+				elem := val.Index(cty.NumberIntVal(int64(i)))
+				elems[i] = elem.GoString()
+			}
+			props[name] = "[" + strings.Join(elems, ", ") + "]"
+		case "bool":
+			props[name] = fmt.Sprintf("%v", val.True())
+		case "number":
+			props[name] = val.GoString()
+		default:
+			props[name] = val.GoString()
+		}
 	}
+	return props
+}
 
-	// Find the matching closing brace
-	braceCount := 0
-	inString := false
-	escapeNext := false
-
-	for i := startIdx; i < len(code); i++ {
-		char := code[i]
-
-		if escapeNext {
-			escapeNext = false
-			continue
-		}
-
-		if char == '\\' {
-			escapeNext = true
-			continue
-		}
-
-		if char == '"' {
-			inString = !inString
-			continue
-		}
-
-		if !inString {
-			if char == '{' {
-				braceCount++
-			} else if char == '}' {
-				braceCount--
-				if braceCount == 0 {
-					return code[startIdx : i+1]
-				}
+// checkResourceSecurity adds basic security/improvement issues
+func checkResourceSecurity(resType, resName string, props map[string]string, issues *[]Issue) {
+	switch resType {
+	case "aws_security_group":
+		if cidr, ok := props["cidr_blocks"]; ok {
+			if strings.Contains(cidr, "0.0.0.0/0") {
+				*issues = append(*issues, Issue{
+					Type:    "security",
+					Message: fmt.Sprintf("Security group '%s' allows 0.0.0.0/0 ingress", resName),
+				})
 			}
 		}
-	}
-
-	return code[startIdx:]
-}
-
-// extractProperties extracts key-value properties from a resource block
-func extractProperties(block string) map[string]string {
-	properties := make(map[string]string)
-
-	// Simple pattern to extract key = value pairs
-	// This is a basic implementation - a full parser would be more robust
-	keyValuePattern := regexp.MustCompile(`(\w+)\s*=\s*"([^"]*)"`)
-	matches := keyValuePattern.FindAllStringSubmatch(block, -1)
-
-	for _, match := range matches {
-		if len(match) >= 3 {
-			key := match[1]
-			value := match[2]
-			properties[key] = value
+	case "aws_iam_role":
+		if policy, ok := props["assume_role_policy"]; ok && strings.Contains(policy, "*") {
+			*issues = append(*issues, Issue{
+				Type:    "security",
+				Message: fmt.Sprintf("IAM role '%s' grants '*' permissions", resName),
+			})
+		}
+	default:
+		// Improvement suggestions for all resources
+		if len(props) == 0 {
+			*issues = append(*issues, Issue{
+				Type:    "improvement",
+				Message: fmt.Sprintf("Resource '%s' has no properties defined", resName),
+			})
 		}
 	}
-
-	return properties
 }
-
