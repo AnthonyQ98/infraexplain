@@ -13,7 +13,8 @@ type ExplainRequest struct {
 }
 
 type ExplainResponse struct {
-	Summary string `json:"summary"`
+	Summary string         `json:"summary"`
+	Issues  []parser.Issue `json:"issues"`
 }
 
 func PostExplain(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +48,7 @@ func PostExplain(w http.ResponseWriter, r *http.Request) {
 	// Respond with the explanation
 	resp := ExplainResponse{
 		Summary: explanation,
+		Issues:  config.Issues,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
